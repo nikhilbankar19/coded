@@ -1,0 +1,132 @@
+import numpy as np
+
+def transform_risk_drivers(data: dict) -> dict:
+    """
+    Apply Risk Driver Processing rules for given JSON (dict) input.
+    Input JSON must have numerators and denominators for each ratio:
+        {
+          "liquidity_num": ...,
+          "liquidity_den": ...,
+          "debt_to_equity_num": ...,
+          "debt_to_equity_den": ...,
+          ...
+        }
+    Returns dict with transformed values.
+    """
+
+    # --- Parameters from the table ---
+    floor = {
+        "liquidity": -1.331599,
+        "debt_to_equity": -0.072346,
+        "int_exp_to_tot_sal": 0.01385,
+        "npbt_to_sal": 10.634398,
+        "ebitda_to_interest": 30.699387
+    }
+    cap = {
+        "liquidity": 4.881646,
+        "debt_to_equity": 3.270405,
+        "int_exp_to_tot_sal": 0.054503,
+        "npbt_to_sal": 44.021908,
+        "ebitda_to_interest": 143.988235
+    }
+    missing_values = {
+        "liquidity": 0.122969,
+        "debt_to_equity": 0.314685,
+        "int_exp_to_tot_sal": 0.0,
+        "npbt_to_sal": 0.0,
+        "ebitda_to_interest": 0.0
+    }
+    transformation = {
+        "liquidity": "raw",
+        "debt_to_equity": "raw",
+        "int_exp_to_tot_sal": "log",
+        "npbt_to_sal": "log",
+        "ebitda_to_interest": "logv2"
+    }
+    a_param = 24.160219  # parameter for logv2
+
+    # --- helper functions ---
+    def compute_ratio(num, den, var):
+        if den == 0 and num > 0:
+            return cap[var]
+        elif den == 0 and num < 0:
+            return floor[var]
+        elif den == 0 and num == 0:
+            return 0
+        elif den < 0:
+            return np.nan
+        else:
+            return num / den
+
+    def log_transform(x):
+        if x is None or np.isnan(x):
+            return np.nan
+        return np.log1p(x) if x > 0 else -np.log1p(abs(x))
+
+    def logv2_transform(x, a=a_param):
+        if x is None or np.isnan(x):
+            return np.nan
+        if x > 0:
+            return np.log1p(x) - np.log1p(a)
+        else:
+            return -(np.log1p(abs(x)) - np.log1p(a))
+
+    # --- process each variable ---
+    variables = ["liquidity", "debt_to_equity", "int_exp_to_tot_sal", "npbt_to_sal", "ebitda_to_interest"]
+
+    results = {}
+
+    for var in variables:
+        num = data.get(f"{var}_num", None)
+        den = data.get(f"{var}_den", None)
+
+        # ratio computation
+        ratio = compute_ratio(num, den, var)
+
+        # missing handling
+        if ratio is None or np.isnan(ratio):
+            ratio = missing_values[var]
+
+        # floor & cap
+        ratio = min(max(ratio, floor[var]), cap[var])
+
+        # transformation
+        if transformation[var] == "raw":
+            trans = ratio
+        elif transformation[var] == "log":
+            trans = log_transform(ratio)
+        elif transformation[var] == "logv2":
+            trans = logv2_transform(ratio)
+
+        results[f"{var}_ratio"] = ratio
+        results[f"{var}_trans"] = trans
+
+    return results
+
+
+# --- Example usage ---
+if __name__ == "__main__":
+    input_json = {
+        "liquidity_num": 10, "liquidity_den": 2,
+        "debt_to_equity_num": 5, "debt_to_equity_den": 0,
+        "int_exp_to_tot_sal_num": 1, "int_exp_to_tot_sal_den": 20,
+        "npbt_to_sal_num": -10, "npbt_to_sal_den": 0,
+        "ebitda_to_interest_num": 100, "ebitda_to_interest_den": 10
+    }
+
+    output = transform_risk_drivers(input_json)
+    print(output)
+
+
+{
+ 'liquidity_ratio': 5.0,
+ 'liquidity_trans': 5.0,
+ 'debt_to_equity_ratio': -0.072346,
+ 'debt_to_equity_trans': -0.072346,
+ 'int_exp_to_tot_sal_ratio': 0.05,
+ 'int_exp_to_tot_sal_trans': 0.048790164,
+ 'npbt_to_sal_ratio': -11.081977,
+ 'npbt_to_sal_trans': -2.493205,
+ 'ebitda_to_interest_ratio': 10.0,
+ 'ebitda_to_interest_trans': -1.279016
+}
