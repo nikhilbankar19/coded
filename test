@@ -1,1 +1,70 @@
+import math
 
+# VOE mappings (first table values)
+VOE_VALUES = {
+    "Liquidity": {
+        1: 2.10897,
+        2: 0.552605,
+        3: -1.524628,
+        4: -2.15248
+    },
+    "CEO": {
+        1: 1.909071,
+        2: 1.297505,
+        3: -0.127374,
+        4: -1.209352
+    },
+    "Region": {
+        "Developed Asia": 1.277397,
+        "EU & North America": 0.362101,
+        "Asia & Pacific, Latin America & Other": -0.382622,
+        "Middle East & Africa, Missing": -1.823703
+    },
+    "Competitive Advantage": {
+        1: 0.17737,   # Very Strong
+        2: 0.0,       # Not given in sheet (assume 0)
+        3: 0.0,
+        4: 0.0
+    },
+    "Industry Group": {
+        "Industry_Group_1": 0.779114,
+        "Industry_Group_2": 0.465656,
+        "Industry_Group_3": -0.302018,
+        "Industry_Group_4": -0.772588
+    }
+}
+
+# Estimates (second table values)
+ESTIMATES = {
+    "Intercept": -5.036144,
+    "Liquidity": -0.794952,
+    "CEO": -0.646951,
+    "Region": -0.531175,
+    "Competitive Advantage": -0.757685,
+    "Industry Group": -0.537716
+}
+
+def calculate_score(input_json):
+    score = ESTIMATES["Intercept"]
+    
+    # Loop through each driver
+    for driver in ["Liquidity", "CEO", "Region", "Competitive Advantage", "Industry Group"]:
+        voe_value = VOE_VALUES[driver][input_json[driver]]
+        score += voe_value * ESTIMATES[driver]
+    
+    # Logistic regression (PD)
+    pd = 1 / (1 + math.exp(-score))
+    
+    return {"Score": score, "PD": pd}
+
+# Example Input
+input_json = {
+    "Liquidity": 1,
+    "CEO": 2,
+    "Region": "Developed Asia",
+    "Competitive Advantage": 1,
+    "Industry Group": "Industry_Group_2"
+}
+
+result = calculate_score(input_json)
+print(result)
