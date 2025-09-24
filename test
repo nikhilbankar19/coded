@@ -1,1 +1,61 @@
 
+import math
+import pandas as pd
+
+# === 1. Parameters from Excel ===
+params = {
+    "Financial": {"mean": -5.730664, "std": 1.138142, "weight": 0.6},
+    "Qual_lt_500": {"mean": -5.273095, "std": 0.7821, "weight": 0.4},
+    "Qual_ge_500": {"mean": -6.121966, "std": 1.539469, "weight": 0.4},  # if used
+}
+
+# Regression estimates
+estimates = {"intercept": -6.139567, "fin_qual_input": 1.894385}
+
+
+# === 2. Function to standardize score ===
+def standardize(raw_score, mean, std):
+    return (raw_score - mean) / std
+
+
+# === 3. Function to compute Fin & Qual input ===
+def fin_qual_input(fin_std, qual_std):
+    return 0.6 * fin_std + 0.4 * qual_std
+
+
+# === 4. Logistic regression PD ===
+def logistic_regression(score):
+    return math.exp(score) / (1 + math.exp(score))
+
+
+# === 5. Apply combined model ===
+def fin_qual_combined(fin_score_raw, qual_score_raw, qual_type="Qual_lt_500"):
+    # Standardize inputs
+    fin_std = standardize(fin_score_raw, params["Financial"]["mean"], params["Financial"]["std"])
+    qual_std = standardize(qual_score_raw, params[qual_type]["mean"], params[qual_type]["std"])
+
+    # Construct input
+    fq_input = fin_qual_input(fin_std, qual_std)
+
+    # Regression score
+    fq_score = estimates["intercept"] + estimates["fin_qual_input"] * fq_input
+
+    # Logistic PD
+    fq_pd = logistic_regression(fq_score)
+
+    # Placeholder: CG mapping (needs mapping table)
+    fq_cg = "Mapped_CG"
+
+    return {
+        "Fin_Std": fin_std,
+        "Qual_Std": qual_std,
+        "FQ_Input": fq_input,
+        "FQ_Score": fq_score,
+        "FQ_PD": fq_pd,
+        "FQ_CG": fq_cg,
+    }
+
+
+# === 6. Example usage ===
+example = fin_qual_combined(fin_score_raw=-6, qual_score_raw=-5.5, qual_type="Qual_lt_500")
+print(pd.DataFrame([example]))
