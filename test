@@ -1,1 +1,349 @@
 
+Here’s a KT-style write-up for this credit model based on the code you shared.
+
+---
+
+## 1. End-to-end Flow of the Code
+
+### 1.1 External scoring entrypoint
+
+* **`score(model, request)`** is the only function meant to be called externally (by Refract/Mosaic).
+* In deployment, it will read `request.json`; in the current version it directly uses `request`.
+* It passes the `payload` to `run_model(payload)` and returns whatever `run_model` returns.
+* Any exception is caught and wrapped into a `MosaicException` with HTTP status 500.
+
+---
+
+### 1.2 Input flattening and preprocessing
+
+* **Input format**:
+  `request` is expected to be a dict with a `"payload"` key.
+  `payload[0]` contains base metadata (scorecardId, country, turnover, etc.).
+  `payload[1]["FinancialData"]` and `payload[2]["NonFinancialData"]` are lists of factor objects.
+
+* **`get_model_json_from_input_json(input_val)`**
+
+  * Takes the raw `input_val` (with `"payload"`) and flattens it into a single `model_json` dict.
+  * Copies all keys from `payload[0]` into `model_json`.
+  * Loops over `payload[1]["FinancialData"]`:
+
+    * For each item, writes:
+
+      * `model_json[i["factor"]] = i["factorValue"]`
+      * `model_json[i["numeratorLabel"]] = i["numeratorValue"]`
+      * `model_json[i["denominatorLabel"]] = i["denominatorValue"]`
+    * Sets `model_json["finance_null"] = False` if there is at least one record; `True` if list is empty.
+  * Loops over `payload[2]["NonFinancialData"]`:
+
+    * For each item, writes `model_json[j["factor"]] = j["factorValue"]`.
+    * Sets `model_json["non_finance_null"] = False` if present; `True` if list is empty.
+  * This gives a flat dictionary of all inputs plus flags to indicate whether financial / non-financial data is missing.
+
+---
+
+### 1.3 Financial part: risk drivers → financial score → financial PD
+
+1. **Transform raw financial ratios**
+
+   * **`transform_risk_drivers(data)`** takes the flat `model_json` and:
+
+     * For each financial risk driver:
+
+       * Builds numerator/denominator from keys like `SCB_LIQUIDITY_WO_XR_N` and `_D`, etc.
+       * Computes a ratio with `compute_ratio`.
+       * Applies `negative_treatment` to handle negative numerator/denominator combinations.
+       * Replaces missing or NaN with pre-defined `missing_values`.
+       * Floors and caps the ratio using driver-specific `floor` and `cap`.
+       * Applies a transformation: raw, log, or logv2.
+     * Returns a dict with keys like `SCB_LIQUIDITY_WO_XR_ratio`, `SCB_LIQUIDITY_WO_XR_trans`, etc.
+
+2. **Calculate financial score**
+
+   * **`calculate_financial_pd(inputs)`**:
+
+     * First maps turnover to a bin WOE via `turnover_usd_up_bin_function` using `inputs["turnover_usd_up"]`.
+     * Then builds a set of transformed financial variables (expected to be passed in as `*_trans`).
+     * Uses the logistic regression coefficients in `ESTIMATES` (intercept + betas) to compute `Financial_Score`.
+     * Returns a dict with `{"Financial_Score": score}`.
+
+3. **Wrap into PD and standardized financial score**
+
+   * In **`run_model`**:
+
+     * If `finance_null == True`, `fin_calculations["Financial_score"]` is set to `None`.
+     * Otherwise:
+
+       * Calls `transform_risk_drivers(model_json)` to generate transformed factors.
+       * Calls `calculate_financial_pd(transformed_factors)` to obtain `Financial_Score`.
+     * PD is computed as `pd_value = 1 / (1 + exp(-Financial_Score))`.
+     * Financial score is standardized using mean and std:
+
+       * `fin_std = (Financial_Score - mean_value) / std_value`
+     * Outputs an internal dict `fin_out` with:
+
+       * `stdFinScore` / `FinStdScore` (standardized financial score)
+       * `Fin_PD` (financial PD)
+
+---
+
+### 1.4 Non-financial part: qualitative score and PD (turnover-based model)
+
+1. **Choice of qualitative model**
+
+   * In **`run_model`**, the variable `turnover = model_json["turnover"]` is used to decide which qualitative model to use.
+   * If `non_finance_null == True`:
+
+     * A fixed missing non-financial score (`missing_non_fin`) is used to compute a PD and standardized non-financial score (`stdNonFinScore`).
+   * Else:
+
+     * If `turnover > 500` and key `BOARDCEO` is present, it calls `qual_gt_500mn_from_raw`.
+     * If `turnover > 500` but `BOARDCEO` is not present, it falls back to `qual_lt_500mn_from_raw`.
+     * If `turnover <= 500`, always uses `qual_lt_500mn_from_raw`.
+
+2. **Qualitative model for turnover < 500mn**
+
+   * **`qual_lt_500mn_from_raw(input_json)`**:
+
+     * Takes raw non-financial inputs from `model_json`:
+
+       * `auditing_firms`, `industry_prospects`, `industry_group`, `region`, `years_customer_relationship`.
+     * Uses WOE mappers:
+
+       * `map_auditing_firms`
+       * `map_industry_prospects`
+       * `map_industry_group`
+       * `map_region`
+       * `map_years_customer_relationship`
+     * Each mapper converts coded or textual values to numeric WOE values.
+     * Then uses `COEFS` (intercept + betas) to compute a linear `score`.
+     * Converts this to PD via a logistic function: `pd = 1 / (1 + exp(-score))`.
+     * Standardizes this non-financial score with a mean and std to get `stdNonFinScore`.
+     * Returns:
+
+       * `woe` sub-dict with all WOE values,
+       * `score` (raw non-financial score),
+       * `pd` (qualitative PD),
+       * `stdNonFinScore` (standardized non-financial score).
+
+3. **Qualitative model for turnover > 500mn**
+
+   * **`qual_gt_500mn_from_raw(input_json)`**:
+
+     * Uses input keys:
+
+       * `"LIO"` (liquidity), `"BOARDCEO"` (CEO), `"Region"`, `"INDGRP"` (industry group), `"COMPADV"` (competitive advantage).
+     * Converts to WOE using:
+
+       * `map_liquidity`, `map_CEO`, `map_region_gt`, `map_industry_grouping_lt_WOE`, `map_Competitive_Advantage_lt_WOE`.
+     * Applies `COEFS_gt_500` as logistic regression coefficients:
+
+       * Computes linear `score` as intercept + Σ(WOE * coef).
+     * Converts to PD: `pd = 1 / (1 + exp(-score))`.
+     * Standardizes the score using `mean_val` and `std_val` to produce `stdNonFinScore`.
+     * Returns:
+
+       * `woe` sub-dict for all drivers,
+       * `score`, `pd`, and `stdNonFinScore`.
+
+   * There is also a **`calculate_score(input_json)`** function that appears to be an alternative implementation of the >500mn qualitative model using a different VOE table/estimate mapping, but it is not used in `run_model`.
+
+---
+
+### 1.5 Combining financial & non-financial, adding sovereign and size cap
+
+1. **Combine Fin & Non-Fin scores**
+
+   * In **`run_model`**, once `fin_calculations` and `non_fin_out` are available:
+
+     * Weighted standardized score:
+
+       * `stdTotalScore = 0.6 * fin_calculations["stdFinScore"] + 0.4 * non_fin_out["stdNonFinScore"]`
+     * Combined Fin+Qual score:
+
+       * `finalTotalScore = total_score_intercept + stdTotalScore * Fin_Qual_Input_coeff`
+     * Combined PD (before sovereign overlay):
+
+       * `pdBeFSov = 1 / (1 + exp(-finalTotalScore))`
+     * `pdBeFSov` is then mapped to a credit grade `cgbefSov` via `CG_MAPPING_pd` table where PD lies between LOWER_PD and UPPER_PD.
+
+2. **Sovereign overlay**
+
+   * Looks up the country’s **sovereign PD**:
+
+     * `FCY_sovRating` from `model_json` is used to pull `MIDPOINT_PD` from `CG_MAPPING`.
+     * `sovFlag` is set to 1 if numeric part of `FCY_sovRating` is ≥ 12, else 0.
+     * `logOddsSovPd = log(FCY_Sovereign_PD / (1 - FCY_Sovereign_PD))`.
+   * Computes sovereign score:
+
+     * `sovScr = sov_score_intercept + fcySovFlag_coeff * sovFlag + logOddsSovPd`.
+     * `sovScrPd = 1 / (1 + exp(-sovScr))`.
+   * Maps sovereign PD to sovereign credit grade `cqsovScr` from `CG_MAPPING_pd`.
+
+3. **Overall standardized score and standalone rating**
+
+   * Standardizes both combined Fin+Qual score and sovereign score:
+
+     * `stdOverallScr = 0.8 * ((finalTotalScore - Fin_Qual_Combined_Score_Mean) / Fin_Qual_Combined_Score_Std_Dev) + 0.2 * ((sovScr - Sovereign_Score_Mean) / Sovereign_Score_Std_Dev)`
+   * Applies an overall transformation:
+
+     * `standaloneScr = tr_intercept + TR_Input * stdOverallScr`.
+     * `standaloneScrPd = 1 / (1 + exp(-standaloneScr))`.
+   * Maps to a standalone credit grade `cgStandaloneScr` using `CG_MAPPING_pd`.
+
+4. **Sales turnover cap**
+
+   * Applies a cap based on sales turnover using `CG_MAPPING_Sales_Turnover`:
+
+     * Finds `salesCapcg` from the table where `Sales_L_Cap <= turnover` (and ILOC 0).
+     * Gets `salesCapPd` – the PD corresponding to `salesCapcg`.
+   * Compares numeric CG for standalone vs size cap:
+
+     * `cg_numeric_standalone` from `CG_MAPPING` for `cgStandaloneScr`.
+     * `cg_numeric_sales` from `CG_MAPPING` for `salesCapcg`.
+     * `cg_with_size_cap = max(cg_numeric_standalone, cg_numeric_sales)`.
+   * Computes `PD_with_size_cap` based on the adjusted CG; however this PD is not propagated back in the final returned JSON (only used internally).
+
+5. **Final output**
+
+   * `run_model` returns a dict with:
+
+     * IDs and metadata from input (`scorecardId`, `cor`, `leid`, `modelType`, `timestamp`, `archiveId`).
+     * `modelVersion` and `sscParameterVersion` hard-coded.
+     * Risk outputs:
+
+       * `pdBeFSov` (PD before sovereign adjustment),
+       * `cgbefSov` (corresponding credit grade),
+       * `standalonePd`,
+       * `standaloneCg` (standalone credit grade after overlays).
+
+   * This is then returned by the outer `score` function.
+
+---
+
+## 2. Function-wise Descriptions
+
+Below are short paragraphs for each function.
+
+### 2.1 Financial risk driver transformation
+
+**`transform_risk_drivers(data: dict) -> dict`**
+Takes raw financial numerators and denominators from the flattened `model_json` and converts them into cleaned, transformed risk drivers. For each variable (liquidity, debt-to-equity, interest expense to sales, NPBT to sales, EBITDA to interest), it computes a ratio using `compute_ratio`, applies special handling for negative or missing values, clamps the ratio within given floor/cap bounds, and then transforms it (raw, log, or logv2). It returns a dictionary with both the final ratio and transformed value for each risk driver.
+
+**`compute_ratio(num, den, var)`**
+Helper function used inside `transform_risk_drivers` to safely divide numerator by denominator. It handles edge cases when the denominator is zero: if numerator is positive, it returns the cap for that variable; if negative, the floor; if both are zero, it returns 0; otherwise it returns the simple ratio `num / den`. This ensures the model avoids division by zero and uses sensible boundary values.
+
+**`log_transform_old(x)`**
+Legacy helper (not currently used in the main final logic) that applies a log1p transform to the absolute value of `x`. If `x` is `None` or NaN, it returns NaN; otherwise it returns `log1p(abs(x))`. It is kept for reference or backward compatibility but not used in the main flow.
+
+**`log_transform(x)`**
+Current log transformation used for some drivers where `transformation[var] == "log"`. It returns `log(x)` when `x` is positive, and a fixed minimum log value `log(0.000001)` when `x` is non-positive to avoid math errors and extreme negative values. If `x` is `None` or NaN, it returns NaN. This ensures a stable log transform for variables that should be strictly positive.
+
+**`negative_treatment(var, x, num, den)`**
+Implements special rules for cases where numerator or denominator is negative for selected ratios. For `SCB_EBITDA_TO_INTEREST_WO_XR`, if both numerator and denominator are negative, it substitutes a fixed “negative case” constant; otherwise it leaves the computed ratio `x` unchanged. For `SCB_DEBT_TO_EQUITY_WO_XR`, if the denominator is negative, it uses a fixed cap; otherwise returns `x`. For other variables it simply returns `x` untouched. This encodes business rules for how to treat negative leverage/coverage situations.
+
+**`logv2_transform_old(x, a=a_param)`**
+Legacy version of the logv2 transformation. It applies an offset log1p transform relative to parameter `a`. For positive `x` it computes `log1p(x) - log1p(a)`; for non-positive `x` it takes the negative of `log1p(abs(x)) - log1p(a)`. If `x` is `None` or NaN it returns NaN. It is not used in the current main logic but preserved for reference.
+
+**`logv2_transform(x, a=a_param)`**
+Current logv2 transformation used when `transformation[var] == "logv2"`. For positive `x` it returns `log(x)`; for non-positive `x` it returns `log(0.000001 + a)` as a fixed fallback (using the `a_param` constant). If `x` is `None` or NaN it returns NaN. This provides a consistent transformation for variables that can be negative or zero, while anchoring non-positive values at a configured level.
+
+---
+
+### 2.2 Turnover binning and financial score
+
+**`turnover_usd_up_bin_function(value)`**
+Maps the turnover in USD (upper bound) into a WOE value based on defined numeric ranges. For missing or negative turnover, it returns a default WOE. For specific ranges (e.g. `<= 2.269`, `<= 4.5692`), it returns corresponding WOE values. This WOE serves as the turnover input to the financial PD regression. (Note: there is a repeated condition `elif value <= 2.269` which looks like a coding artefact and should be reviewed.)
+
+**`calculate_financial_pd(inputs: dict) -> dict`**
+Implements the logistic regression model for the financial part. It first maps the raw `turnover_usd_up` into a turnover WOE via `turnover_usd_up_bin_function`. Then it assembles a set of transformed financial variables from `inputs` (e.g. `SCB_LIQUIDITY_trans`, `SCB_DEBT_TO_EQUITY_WO_XR_trans`, etc.), applies the `ESTIMATES` coefficients (including an intercept) to compute a financial score. The function currently returns only `{"Financial_Score": score}`, which is later converted to PD in `run_model`.
+
+---
+
+### 2.3 Qualitative mappers (< 500mn)
+
+**`map_auditing_firms(val: Any) -> float`**
+Converts the “auditing firm” information into a WOE value. Accepts numeric class codes or descriptive strings. For numeric input it directly indexes into `AUDITING_WOE`. For strings, it uses simple keyword matching (e.g. “top”/“4” indicates class 1; “asian”/“other” indicates class 2; “audit” maps to class 3). Unknown or missing values fallback to 0.0. This allows both coded and textual inputs from questionnaires to be used.
+
+**`map_industry_prospects(val: Any) -> float`**
+Maps the qualitative assessment of industry prospects into a WOE. For numeric codes, it looks up `IND_PROSPECTS_WOE`. For string descriptions, it looks for keywords such as “growing and low”, “stable”, “growing but high”, or “declin” to pick the appropriate class. Missing or unknown values return 0.0. This transforms narrative survey answers into numeric risk contributions.
+
+**`map_industry_group(val: Any) -> float`**
+Converts the industry group classification into a WOE. If the value is numeric, it directly indexes `IND_GROUP_WOE`. For strings, it searches for tokens like `group_1`, `industry_group_2`, or a trailing digit. If no mapping is found, it returns 0.0. It ensures that both symbolic and numeric industry codes map to consistent WOE values.
+
+**`map_region(val: Any) -> float`**
+Maps customer region to a WOE for the <500mn model. For missing values, it uses the “MEA/LA/other/missing” category. For strings, it checks for keywords like “developed”, “asia”, “eu”, “north america”, or “asia pacific” to assign the correct regional bucket. Any other / unrecognized regions are treated as the default high-risk bucket (`mea_la_other_missing`).
+
+**`map_years_customer_relationship(years: Optional[float]) -> float`**
+Bins the duration of the customer relationship into one of several WOE bands based on the number of years. It handles missing, non-numeric, or out-of-range values by mapping them to a “missing_or_outside” WOE. Valid inputs are categorized into 0–8, 9–21, or 22–150 years, with each band mapped to its corresponding WOE. This captures the impact of relationship length on risk.
+
+---
+
+### 2.4 Qualitative model (< 500mn)
+
+**`qual_lt_500mn_from_raw(input_json: Dict[str, Any]) -> Dict[str, Any>`**
+Implements the qualitative score and PD model for customers with turnover below 500mn (and for some fallback cases >500mn). It reads raw non-financial factors from `input_json` (auditor, industry prospects, industry group, region, years of relationship), converts them to WOE values using the mapping helpers, and then computes a linear score using the `COEFS` intercept and coefficients. The score is converted to PD via the logistic function. It also standardizes the score using configured mean and std to produce `stdNonFinScore`. The function returns a dictionary containing the WOE values, the raw score, the PD, and the standardized score.
+
+---
+
+### 2.5 Qualitative mappers and model (> 500mn)
+
+**`map_liquidity(val: Any) -> float`**
+Maps a liquidity category (given as a string key “1”, “2”, etc.) to the corresponding WOE in `Liquidity_WOE`. It expects the raw value to match the dictionary keys and returns the numeric WOE.
+
+**`map_CEO(val: Any) -> float`**
+Maps a CEO/governance category (as string “1”, “2”, etc.) to the corresponding `CEO_WOE`. It converts the input to lower case string and indexes the dictionary, returning the corresponding WOE.
+
+**`map_region_gt(val: Any) -> float`**
+Maps region into WOE for the >500mn model. For missing values it uses the `mea_other_missing` WOE. For strings, it checks for keywords (“develop”, “asia”, “eu”, “north america”, “asia pacific”, “other”) to classify into one of four regional buckets: developed Asia, EU/NA, Asia Pacific/other, or MEA/other/missing. This reflects a different region segmentation from the <500mn model.
+
+**`map_industry_grouping_lt_WOE(val: Any) -> float`**
+Maps an industry group label (e.g. `"Industry_Group_1"`) directly to its WOE in `industry_grouping_lt_WOE`. It expects the value to already match the dictionary keys and returns the numeric WOE.
+
+**`map_Competitive_Advantage_lt_WOE(val: Any) -> float`**
+Maps competitive advantage categories (string “1”, “2”, etc.) to their WOE values using `Competitive_Advantage_lt_WOE`. It converts the input to lower case string and indexes the dictionary; this captures differences in competitive positioning in the qualitative score.
+
+**`qual_gt_500mn_from_raw(input_json: Dict[str, Any]) -> Dict[str, Any>`**
+Implements the qualitative model for customers with turnover greater than 500mn (when the required inputs are present). It reads non-financial factors (`LIO`, `BOARDCEO`, `Region`, `INDGRP`, `COMPADV`) from `input_json`, converts them to WOE using the mapping functions, and then applies `COEFS_gt_500` to compute a linear score. PD is calculated using the logistic transformation, and a standardized non-financial score (`stdNonFinScore`) is derived using predefined mean and standard deviation. It returns a dictionary containing the WOE values, the raw score, PD, and standardized non-financial score.
+
+---
+
+### 2.6 Alternative VOE model (not used in main flow)
+
+**`calculate_score(input_json)`**
+An alternative implementation of the >500mn qualitative model using separate VOE and ESTIMATE tables (`VOE_VALUES`, `ESTIMATES`). It loops through drivers (“Liquidity”, “CEO”, “Region”, “Competitive Advantage”, “Industry Group”), multiplies each driver’s WOE by its coefficient, adds the intercept, and then converts that score to a PD via a logistic regression. It returns a dict with `"score"` and `"PD"`. This function is not currently called by `run_model`, but is available as a reference or for testing.
+
+---
+
+### 2.7 Generic standardization and combined Fin+Qual helper
+
+**`standardize(raw_score, mean, std)`**
+Utility function that converts a raw score into a standardized z-score using `(raw_score - mean) / std`. It is used in the generic combined model functions (and similarly replicated inside `run_model` for specific scores). This allows scores from different models to be placed on a common scale.
+
+**`fin_qual_input(fin_std, qual_std)`**
+Computes the combined Fin+Qual input as a weighted average of standardized financial and qualitative scores (`0.6 * fin_std + 0.4 * qual_std`). It represents the combined risk driver input to a top-level logistic regression model.
+
+**`logistic_regression(score)`**
+Applies the logistic function to a given score: `exp(score) / (1 + exp(score))`. It converts a linear score into a probability (PD) between 0 and 1. Used by the generic combined model and conceptually mirrors the PD calculations elsewhere.
+
+**`fin_qual_combined(fin_score_raw, qual_score_raw, qual_type="Qual_lt_500")`**
+A self-contained function that computes a combined Fin+Qual score and PD using the generic parameter dictionaries (`params`, `estimates`). It standardizes the raw financial and qualitative scores, combines them using `fin_qual_input`, applies a regression with `estimates["intercept"]` and `estimates["fin_qual_input"]`, and then converts to a PD via `logistic_regression`. It also returns a placeholder `FQ_CG` label. This function is conceptually similar to what `run_model` does but is not used in the current finalized flow.
+
+---
+
+### 2.8 Main orchestration and scoring wrapper
+
+**`run_model(input_val)`**
+This is the core orchestration function that ties together all pieces of the model. It:
+
+1. Reads `CG_MAPPING.csv` and splits it into a PD mapping table and a Sales Turnover cap table.
+2. Calls `get_model_json_from_input_json` to flatten the incoming payload into `model_json`.
+3. Executes the **financial** block (transform risk drivers, compute financial score and PD, standardize financial score).
+4. Executes the **non-financial** block (selects <500 or >500 qualitative model or missing logic, computes qualitative score/PD, standardizes non-financial score).
+5. Combines financial and qualitative scores into a total standardized score, applies a logistic regression to get `pdBeFSov`, and maps this PD to a credit grade.
+6. Computes a sovereign-adjusted score and PD using sovereign PD inputs and mapping tables.
+7. Combines the Fin+Qual and sovereign standardized scores to get an overall score, then transforms this into a standalone PD and standalone credit grade.
+8. Applies a sales turnover cap by comparing the standalone grade with a sales-based cap grade and adjusting numerically.
+9. Assembles and returns a final JSON with key identifiers and PD/grade fields (pre-sovereign PD, standalone PD, grades, parameter versions, etc.).
+
+This is the function that implements the full credit rating logic end-to-end.
+
